@@ -1,0 +1,330 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Mic, MicOff, Volume2, VolumeX, MessageSquare, Send, RefreshCw, StopCircle, AlertCircle, Sparkles } from 'lucide-react';
+
+const API_KEY = ""; 
+const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
+const TTS_MODEL = "gemini-2.5-flash-preview-tts";
+
+const App = () => {
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [messages, setMessages] = useState([
+    { role: 'ai', text: 'Xin chào! Tôi đã được nâng cấp giọng nói mới truyền cảm hơn. Hãy thử trò chuyện với tôi nhé!' }
+  ]);
+  const [inputText, setInputText] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const [autoSpeak, setAutoSpeak] = useState(true);
+  const [errorMessage, setErrorMessage] = useState('');
+  
+  const scrollRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const audioSourceRef = useRef(null);
+
+  // Helper function for exponential backoff
+  const fetchWithRetry = async (url, options, maxRetries = 5) => {
+    let delay = 1000;
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        const response = await fetch(url, options);
+        if (response.ok) return response;
+        if (response.status === 429 || response.status >= 500) {
+          await new Promise(resolve => setTimeout(resolve, delay));
+          delay *= 2;
+          continue;
+        }
+        return response;
+      } catch (err) {
+        if (i === maxRetries - 1) throw err;
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2;
+      }
+    }
+  };
+
+  // Khởi tạo nhận diện giọng nói
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.lang = 'vi-VN'; 
+
+      recognition.onstart = () => setIsListening(true);
+      recognition.onresult = (event) => {
+        const transcript = event.results[0][0].transcript;
+        handleSendMessage(transcript);
+      };
+      recognition.onerror = () => setIsListening(false);
+      recognition.onend = () => setIsListening(false);
+      recognitionRef.current = recognition;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages, isTyping]);
+
+  // Hàm chuyển đổi PCM sang WAV để phát audio từ Gemini TTS
+  const pcmToWav = (pcmData, sampleRate) => {
+    const buffer = new ArrayBuffer(44 + pcmData.length * 2);
+    const view = new DataView(buffer);
+
+    const writeString = (offset, string) => {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    };
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 32 + pcmData.length * 2, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, pcmData.length * 2, true);
+
+    for (let i = 0; i < pcmData.length; i++) {
+      view.setInt16(44 + i * 2, pcmData[i], true);
+    }
+
+    return new Blob([buffer], { type: 'audio/wav' });
+  };
+
+  // Hàm phát âm thanh diễn cảm bằng Gemini TTS
+  const speakWithGemini = async (text) => {
+    stopSpeaking();
+    setIsSpeaking(true);
+
+    try {
+      const response = await fetchWithRetry(
+        `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent?key=${API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: `Hãy nói bằng giọng truyền cảm, nhẹ nhàng, tự nhiên như người thật: ${text}` }] }],
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName: "Kore" 
+                  }
+                }
+              }
+            }
+          }),
+        }
+      );
+
+      if (!response || !response.ok) {
+        throw new Error(`TTS API failed with status ${response?.status}`);
+      }
+
+      const data = await response.json();
+      const audioData = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+      if (audioData) {
+        const binaryString = atob(audioData);
+        const len = binaryString.length;
+        const bytes = new Int16Array(len / 2);
+        for (let i = 0; i < len; i += 2) {
+          bytes[i / 2] = binaryString.charCodeAt(i) | (binaryString.charCodeAt(i + 1) << 8);
+        }
+
+        const wavBlob = pcmToWav(bytes, 24000);
+        const audioUrl = URL.createObjectURL(wavBlob);
+        const audio = new Audio(audioUrl);
+        
+        audioSourceRef.current = audio;
+        audio.onended = () => setIsSpeaking(false);
+        audio.onerror = () => setIsSpeaking(false);
+        audio.play().catch(e => {
+          console.error("Audio play error:", e);
+          setIsSpeaking(false);
+        });
+      } else {
+        setIsSpeaking(false);
+      }
+    } catch (error) {
+      console.error("TTS Error:", error);
+      setIsSpeaking(false);
+      setErrorMessage("Không thể tải giọng nói lúc này.");
+      setTimeout(() => setErrorMessage(''), 3000);
+    }
+  };
+
+  const stopSpeaking = () => {
+    if (audioSourceRef.current) {
+      audioSourceRef.current.pause();
+      audioSourceRef.current = null;
+    }
+    setIsSpeaking(false);
+  };
+
+  const toggleListening = () => {
+    if (isListening) {
+      recognitionRef.current?.stop();
+    } else {
+      stopSpeaking();
+      recognitionRef.current?.start();
+    }
+  };
+
+  const handleSendMessage = async (text) => {
+    if (!text.trim()) return;
+
+    const newMessages = [...messages, { role: 'user', text }];
+    setMessages(newMessages);
+    setInputText('');
+    setIsTyping(true);
+
+    try {
+      const response = await fetchWithRetry(
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: text }] }],
+            systemInstruction: { 
+              parts: [{ text: "Bạn là một trợ lý ảo tiếng Việt có giọng nói ấm áp, diễn cảm. Trả lời ngắn gọn, tự nhiên như đang tâm sự. Tuyệt đối không dùng tiếng Anh." }] 
+            }
+          }),
+        }
+      );
+
+      if (!response || !response.ok) throw new Error("Chat API failed");
+
+      const data = await response.json();
+      const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text || "Tôi đang nghe đây.";
+
+      setMessages(prev => [...prev, { role: 'ai', text: responseText }]);
+      if (autoSpeak) await speakWithGemini(responseText);
+    } catch (error) {
+      console.error("Chat Error:", error);
+      setMessages(prev => [...prev, { role: 'ai', text: "Kết nối hơi chậm, bạn đợi xíu nhé." }]);
+    } finally {
+      setIsTyping(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-neutral-50 font-sans text-slate-800 overflow-hidden">
+      {/* Header */}
+      <header className="bg-white border-b px-6 py-4 flex items-center justify-between shadow-sm z-20">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-full flex items-center justify-center text-white shadow-lg">
+            <Sparkles size={20} />
+          </div>
+          <div>
+            <h1 className="font-bold text-base md:text-lg">AI Diễn Cảm</h1>
+            <p className="text-[10px] font-bold text-indigo-500 uppercase tracking-widest">Giọng nói thế hệ mới</p>
+          </div>
+        </div>
+        
+        <button 
+          onClick={() => setAutoSpeak(!autoSpeak)}
+          className={`flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold transition-all ${
+            autoSpeak ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-400'
+          }`}
+        >
+          {autoSpeak ? <Volume2 size={14} /> : <VolumeX size={14} />}
+          {autoSpeak ? 'TỰ ĐỘNG NÓI' : 'CHỈ NHẮN TIN'}
+        </button>
+      </header>
+
+      {errorMessage && (
+        <div className="mx-6 mt-4 p-3 bg-red-50 text-red-600 rounded-xl flex items-center gap-2 text-sm animate-in fade-in slide-in-from-top-1">
+          <AlertCircle size={16} /> {errorMessage}
+        </div>
+      )}
+
+      {/* Chat Area */}
+      <main ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-6 max-w-2xl mx-auto w-full">
+        {messages.map((msg, index) => (
+          <div key={index} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2`}>
+            <div className={`p-4 rounded-2xl shadow-sm text-sm md:text-base leading-relaxed max-w-[85%] ${
+              msg.role === 'user' ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white border border-slate-100 rounded-tl-none'
+            }`}>
+              {msg.text}
+              {msg.role === 'ai' && (
+                <button onClick={() => speakWithGemini(msg.text)} className="ml-2 text-indigo-400 hover:text-indigo-600">
+                  <Volume2 size={14} className="inline mb-1" />
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+        {isTyping && <div className="text-[10px] text-slate-400 italic animate-pulse">AI đang suy nghĩ...</div>}
+      </main>
+
+      {/* Visualizer */}
+      {(isListening || isSpeaking) && (
+        <div className="flex justify-center items-center gap-1.5 h-16 mb-2">
+          {[...Array(20)].map((_, i) => (
+            <div key={i} className={`w-1 rounded-full animate-wave ${isListening ? 'bg-rose-400' : 'bg-indigo-400'}`}
+                 style={{ height: '20%', animationDelay: `${i * 0.05}s` }}></div>
+          ))}
+        </div>
+      )}
+
+      {/* Controls */}
+      <footer className="p-6 bg-white border-t border-slate-100 shadow-2xl">
+        <div className="max-w-2xl mx-auto flex items-center gap-4">
+          <div className="relative flex-1">
+            <input 
+              type="text" 
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSendMessage(inputText)}
+              placeholder="Nhập lời muốn nói..."
+              className="w-full py-4 pl-5 pr-12 rounded-2xl bg-slate-50 border-none outline-none focus:ring-2 focus:ring-indigo-500 transition-all shadow-inner"
+            />
+            <button 
+              onClick={() => handleSendMessage(inputText)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 p-2 text-indigo-600 disabled:opacity-20"
+              disabled={!inputText.trim()}
+            >
+              <Send size={20} />
+            </button>
+          </div>
+          
+          <button 
+            onClick={toggleListening}
+            className={`w-14 h-14 rounded-full flex items-center justify-center shadow-xl transition-all active:scale-90 ${
+              isListening ? 'bg-rose-500 text-white animate-pulse' : 'bg-indigo-600 text-white'
+            }`}
+          >
+            {isListening ? <MicOff size={24} /> : <Mic size={24} />}
+          </button>
+          
+          {isSpeaking && (
+            <button onClick={stopSpeaking} className="w-14 h-14 rounded-full bg-slate-800 text-white flex items-center justify-center">
+              <StopCircle size={24} />
+            </button>
+          )}
+        </div>
+      </footer>
+
+      <style>{`
+        @keyframes wave {
+          0%, 100% { height: 20%; opacity: 0.5; }
+          50% { height: 100%; opacity: 1; }
+        }
+        .animate-wave { animation: wave 0.6s ease-in-out infinite; }
+      `}</style>
+    </div>
+  );
+};
+
+export default App;
